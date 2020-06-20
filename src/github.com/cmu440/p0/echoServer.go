@@ -12,7 +12,7 @@ import (
 )
 
 // 锁
-var mutexP *Mutex = NewMutex()
+var mutexP = NewMutex()
 
 type EchoServer struct {
 	listener net.Listener
@@ -20,74 +20,75 @@ type EchoServer struct {
 	// 还在保持可读连接的客户端
 	readerConns map[net.Conn]bool
 	// 还在保持可写连接的客户端
-	writerConns map[net.Conn]bool
+	writerConns map[net.Conn]chan string
 	// 接受到来自客户端的数据，按 行 为单位
 	receiveLineChan chan string
 }
 
 // 不断读取输入，然后广播
 func (es *EchoServer) broadcastLoop() {
-	for {
-		line := <-es.receiveLineChan
-		es.broadcast(line)
+	for line, ok := <-es.receiveLineChan; ok; line, ok = <-es.receiveLineChan {
+		go es.broadcast(line)
 	}
 }
 
 // 将1条消息（无换行符，需手动添加），广播给所有客户端
 func (es *EchoServer) broadcast(line string) {
-	for conn := range es.writerConns {
-		_, err := conn.Write([]byte(line + "\n"))
-		if err != nil {
-			// 出现问题
-			func() {
-				mutexP.Lock()
-				defer mutexP.UnLock()
-				delete(es.writerConns, conn)
-			}()
-		}
+	for _, lineChan := range es.writerConns {
+		lineChan <- line
 	}
 }
 
 func (es *EchoServer) handleListener() {
 	conn, err := es.listener.Accept()
 	for err == nil {
-		go es.handleReaderConn(conn)
-		// 添加写入的conn
+		// 防止崩溃无法释放锁
 		func() {
 			mutexP.Lock()
 			defer mutexP.UnLock()
-			es.writerConns[conn] = true
+			es.readerConns[conn] = true
+			// 添加写入的conn
+			es.writerConns[conn] = make(chan string, 100)
 		}()
+		go es.handleReaderConn(conn)
+		go es.handleWriterConn(conn, es.writerConns[conn])
 		conn, err = es.listener.Accept()
 	}
 	// 已经close
 	fmt.Println("listener", es.listener, "meet some error:", err)
 }
 
-func (es *EchoServer) handleReaderConn(conn net.Conn)  {
-	// 防止崩溃无法释放锁
-	func() {
-		mutexP.Lock()
-		defer mutexP.UnLock()
-		es.readerConns[conn] = true
-	}()
-
+func (es *EchoServer) handleReaderConn(conn net.Conn) {
+	defer conn.Close()
 	defer func() {
 		mutexP.Lock()
 		defer mutexP.UnLock()
 		delete(es.readerConns, conn)
 	}()
-	//defer conn.Close()
 	reader := bufio.NewReader(conn)
-	lineBytes, _, err := reader.ReadLine()
-	for err == nil {
+	for lineBytes, _, err := reader.ReadLine();
+		err == nil;
+	lineBytes, _, err = reader.ReadLine() {
 		// 提供接收到的消息
 		es.receiveLineChan <- string(lineBytes)
-
-		// 继续接收
-		lineBytes, _, err = reader.ReadLine()
 	}
-	//fmt.Println("read end", conn, err)
+}
+
+func (es *EchoServer) handleWriterConn(conn net.Conn, lineChan <-chan string) {
+	defer conn.Close()
+	defer func() {
+		mutexP.Lock()
+		defer mutexP.UnLock()
+		delete(es.writerConns, conn)
+	}()
+	// 从channel中读消息，发送
+	for line, ok := <-lineChan; !es.isClose && ok; line, ok = <-lineChan {
+		_, err := conn.Write([]byte(line + "\n"))
+		if err != nil {
+			// 出现问题
+			break
+		}
+	}
 }
 
 func NewEchoServer(listener net.Listener) *EchoServer {
@@ -95,7 +96,7 @@ func NewEchoServer(listener net.Listener) *EchoServer {
 		listener,
 		false,
 		make(map[net.Conn]bool),
-		make(map[net.Conn]bool),
+		make(map[net.Conn]chan string),
 		make(chan string, 100),
 	}
 	// 处理广播

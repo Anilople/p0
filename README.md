@@ -13,6 +13,12 @@ on Piazza as well.
 
 ## Running the official tests
 
+记得先
+```shell script
+$ export GOPATH=xxx
+```
+把`GOPATH`设置好，然后取消`go mod`
+
 To test your submission, we will execute the following command from inside the
 `src/github.com/cmu440/p0` directory:
 
